@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project]
+name = "secure-mcp-readonly-db-proof"
+version = "0.1.0"
+description = "Read-only MCP server over a business database: per-user bearer tokens, named-query allowlist, row caps, quotas and an audit log."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp==2.3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.2.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
