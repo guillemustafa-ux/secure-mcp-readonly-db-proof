@@ -42,14 +42,22 @@ def test_read_only_file_blocks_writes_even_without_the_authorizer(db_path):
         "SELECT * FROM payroll",
         "SELECT name FROM customers UNION SELECT full_name FROM payroll",
         "PRAGMA table_info(payroll)",
-        "SELECT load_extension('x')",
         "SELECT * FROM sqlite_master",
     ],
 )
-def test_authorizer_blocks_reads_outside_the_allowed_tables_and_functions(db_path, sql):
+def test_authorizer_blocks_reads_outside_the_allowed_tables(db_path, sql):
     conn = connect_readonly(db_path)
     with pytest.raises(sqlite3.DatabaseError):
         conn.execute(sql).fetchall()
+
+
+def test_authorizer_blocks_functions_outside_the_short_list(db_path):
+    # hex() is harmless and works on a plain connection, so only the
+    # authorizer's function list can refuse it.
+    assert sqlite3.connect(":memory:").execute("SELECT hex('a')").fetchone() == ("61",)
+    conn = connect_readonly(db_path)
+    with pytest.raises(sqlite3.DatabaseError, match="not authorized to use function: hex"):
+        conn.execute("SELECT hex(name) FROM customers").fetchall()
 
 
 def test_attach_is_blocked(db_path, tmp_path):

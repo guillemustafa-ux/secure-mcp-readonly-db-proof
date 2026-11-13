@@ -1,7 +1,8 @@
 """Read-only database access with two independent guards.
 
-1. The file is opened with SQLite's ``mode=ro`` URI, so the connection cannot
-   write even if a statement tried to.
+1. The file is opened with SQLite's ``mode=ro`` URI, so SQLite refuses to
+   modify the database file. On its own that still allows ``VACUUM INTO``,
+   ``ATTACH`` and temporary tables, which is why there is a second layer.
 2. An authorizer callback allows only reads. It denies writes, ATTACH,
    PRAGMA, schema changes and transactions, and it limits which tables can be
    read, so a table outside the allowlist (payroll here) stays unreadable even

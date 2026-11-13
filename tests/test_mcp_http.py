@@ -7,6 +7,7 @@ import json
 import socket
 import threading
 import time
+from contextlib import contextmanager
 
 import httpx2
 import pytest
@@ -37,29 +38,41 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def live(tmp_path_factory, db_path):
-    tmp = tmp_path_factory.mktemp("live")
-    store = TokenStore(tmp / "tokens.json")
-    tokens = {
-        "reader": store.issue("ana", ["erp:read"], 3600),
-        "finance": store.issue("fin", ["erp:read", "erp:finance"], 3600),
-        "no_read": store.issue("eve", ["erp:finance"], 3600),
-    }
-    port = _free_port()
-    app = build_app(db_path, tmp / "tokens.json", tmp / "audit.jsonl", "127.0.0.1", port,
-                    "https://idp.example.com", quota_limit=100, quota_window=60, hard_row_cap=200)
+@contextmanager
+def _serving(app, port):
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
-    deadline = time.time() + 10
-    while not server.started:
-        if time.time() > deadline:
-            raise RuntimeError("server did not start")
-        time.sleep(0.05)
-    yield {"url": f"http://127.0.0.1:{port}/mcp", "tokens": tokens, "audit": tmp / "audit.jsonl"}
-    server.should_exit = True
-    thread.join(timeout=5)
+    try:
+        deadline = time.time() + 10
+        while not server.started:
+            if time.time() > deadline:
+                raise RuntimeError("server did not start")
+            time.sleep(0.05)
+        yield
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
+def _app(db_path, tmp, port, audit_path=None):
+    return build_app(db_path, tmp / "tokens.json", audit_path or tmp / "audit.jsonl", "127.0.0.1", port,
+                     "https://idp.example.com", quota_limit=100, quota_window=60, hard_row_cap=200)
+
+
+@pytest.fixture(scope="module")
+def live(tmp_path_factory, db_path):
+    tmp = tmp_path_factory.mktemp("live")
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}/mcp"
+    store = TokenStore(tmp / "tokens.json")
+    tokens = {
+        "reader": store.issue("ana", ["erp:read"], 3600, url),
+        "finance": store.issue("fin", ["erp:read", "erp:finance"], 3600, url),
+        "no_read": store.issue("eve", ["erp:finance"], 3600, url),
+    }
+    with _serving(_app(db_path, tmp, port), port):
+        yield {"url": url, "tokens": tokens, "audit": tmp / "audit.jsonl", "tmp": tmp}
 
 
 def _post(url, token=None):
@@ -78,28 +91,12 @@ def test_a_token_without_the_base_scope_is_refused(live):
     assert _post(live["url"], live["tokens"]["no_read"]).status_code == 403
 
 
-def test_a_valid_token_for_another_resource_is_refused(live, db_path, tmp_path):
-    """Same token store, but the verifier says the token was issued for another server."""
-    port = _free_port()
-    store_path = tmp_path / "tokens.json"
-    token = TokenStore(store_path).issue("ana", ["erp:read"], 3600)
-    gateway = Gateway(connect_readonly(db_path), load_allowlist(), SlidingWindowQuota(10, 60),
-                      JsonlAuditSink(tmp_path / "audit.jsonl"))
-    wrong_audience = StoreVerifier(TokenStore(store_path), resource="https://other-server.example.com/mcp")
-    app = build_server(gateway, wrong_audience, f"http://127.0.0.1:{port}", "https://idp.example.com") \
-        .streamable_http_app(host="127.0.0.1")
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    try:
-        deadline = time.time() + 10
-        while not server.started:
-            assert time.time() < deadline
-            time.sleep(0.05)
-        assert _post(f"http://127.0.0.1:{port}/mcp", token).status_code == 401
-    finally:
-        server.should_exit = True
-        thread.join(timeout=5)
+def test_a_token_issued_for_another_server_is_refused(live, db_path):
+    """Server B shares server A's token file; A's tokens must not open B."""
+    port_b = _free_port()
+    with _serving(_app(db_path, live["tmp"], port_b, audit_path=live["tmp"] / "audit-b.jsonl"), port_b):
+        assert _post(live["url"], live["tokens"]["reader"]).status_code == 200
+        assert _post(f"http://127.0.0.1:{port_b}/mcp", live["tokens"]["reader"]).status_code == 401
 
 
 async def _session(url, token, fn):
@@ -148,17 +145,41 @@ def test_finance_token_runs_finance_queries(live):
 
 def test_http_calls_land_in_the_audit_file_without_the_token(live):
     async def fn(client):
-        return await client.call_tool("run_query", {"name": "customer_by_id", "params": {"customer_id": 5}})
+        await client.call_tool("run_query", {"name": "customer_by_id", "params": {"customer_id": 5}})
+        # the caller puts its own token in the name field: it must not reach the log
+        await client.call_tool("run_query", {"name": live["tokens"]["reader"], "params": {}})
 
     _run(live, "reader", fn)
     text = live["audit"].read_text(encoding="utf-8")
     events = [json.loads(line) for line in text.splitlines()]
-    assert any(e["subject"] == "ana" and e["params"] == {"customer_id": 5} and e["outcome"] == "ok" for e in events)
+    assert any(e["subject"] == "ana" and e["client_id"] == "local-cli" and e["params"] == {"customer_id": 5}
+               and e["outcome"] == "ok" for e in events)
+    assert any(e["outcome"] == "denied:unknown_query" and e["query"] is None for e in events)
     for token in live["tokens"].values():
         assert token not in text
 
 
-def test_without_a_bearer_context_the_tools_fail_closed(db_path, tmp_path):
+def test_if_the_audit_file_cannot_be_written_the_client_gets_an_error_and_no_rows(db_path, tmp_path):
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}/mcp"
+    token = TokenStore(tmp_path / "tokens.json").issue("ana", ["erp:read"], 3600, url)
+    unwritable = tmp_path / "audit-is-a-directory"
+    unwritable.mkdir()
+    with _serving(_app(db_path, tmp_path, port, audit_path=unwritable), port):
+        async def fn(client):
+            return await client.call_tool("run_query", {"name": "customer_by_id", "params": {"customer_id": 3}})
+
+        result = asyncio.run(_session(url, token, fn))
+    assert result.is_error is True
+    assert not result.structured_content
+    assert "Acme" not in json.dumps([c.model_dump() for c in result.content])
+
+
+@pytest.mark.parametrize(
+    "tool, args",
+    [("run_query", {"name": "customer_by_id", "params": {"customer_id": 1}}), ("list_queries", {})],
+)
+def test_without_a_bearer_context_the_tools_fail_closed(db_path, tmp_path, tool, args):
     """In-process client, no HTTP and so no token: tools must refuse, not run anonymously."""
     gateway = Gateway(connect_readonly(db_path), load_allowlist(), SlidingWindowQuota(10, 60),
                       JsonlAuditSink(tmp_path / "audit.jsonl"))
@@ -167,7 +188,7 @@ def test_without_a_bearer_context_the_tools_fail_closed(db_path, tmp_path):
 
     async def fn():
         async with Client(server) as client:
-            return await client.call_tool("run_query", {"name": "customer_by_id", "params": {"customer_id": 1}})
+            return await client.call_tool(tool, args)
 
     result = asyncio.run(fn())
     assert result.is_error is True

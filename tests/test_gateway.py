@@ -1,8 +1,10 @@
+import hashlib
 import json
 
 import pytest
 
 from secure_mcp.gateway import AuditUnavailable, Denied
+from secure_mcp.queries import NamedQuery, load_allowlist
 from secure_mcp.quota import SlidingWindowQuota
 
 from conftest import FINANCE, READER, BrokenSink, count_rows
@@ -130,6 +132,48 @@ def test_every_call_is_audited_without_rows_or_sensitive_values(make_gateway, si
     assert first["params"]["name_prefix"].startswith("sha256:")
     dumped = json.dumps(sink.events)
     assert "Acme" not in dumped  # neither the sensitive value nor any returned row
+
+
+def test_sensitive_values_are_logged_as_their_exact_sha256(make_gateway, sink):
+    make_gateway().run(READER, "customer_search", {"name_prefix": "Acme"})
+    assert sink.events[-1]["params"]["name_prefix"] == "sha256:" + hashlib.sha256(b'"Acme"').hexdigest()
+
+
+def test_a_name_outside_the_allowlist_is_never_written_to_the_log(make_gateway, sink):
+    secret = "tok_live_SECRET_" + "x" * 5000
+    with pytest.raises(Denied):
+        make_gateway().run(READER, secret, {})
+    assert sink.events[-1]["outcome"] == "denied:unknown_query"
+    assert sink.events[-1]["query"] is None
+    assert "tok_live_SECRET" not in json.dumps(sink.events)
+
+
+def test_every_outcome_writes_one_line_with_who_and_what(make_gateway, sink):
+    broken = NamedQuery("payroll_names", "", "SELECT full_name FROM payroll", {}, "erp:read", 5)
+    allowlist = {**load_allowlist(), broken.name: broken}
+    gw = make_gateway(quota=SlidingWindowQuota(4, 60, clock=lambda: 0.0), allowlist=allowlist)
+    gw.visible_queries(READER)
+    gw.run(READER, "customer_by_id", {"customer_id": 1})
+    with pytest.raises(Denied) as db_error:
+        gw.run(READER, "payroll_names", {})  # the authorizer refuses it at runtime
+    with pytest.raises(Denied):
+        gw.run(READER, "no_such_query", {})
+    with pytest.raises(Denied):
+        gw.run(READER, "customer_by_id", {"customer_id": 1})
+    assert db_error.value.code == "database_error"
+    assert [(e["tool"], e["outcome"]) for e in sink.events] == [
+        ("list_queries", "ok"),
+        ("run_query", "ok"),
+        ("run_query", "error:database"),
+        ("run_query", "denied:unknown_query"),
+        ("run_query", "denied:quota_exceeded"),
+    ]
+    assert {(e["subject"], e["client_id"]) for e in sink.events} == {("ana", "test-client")}
+
+
+def test_hard_row_cap_must_be_positive(make_gateway):
+    with pytest.raises(ValueError):
+        make_gateway(hard_row_cap=0)
 
 
 def test_if_the_audit_line_cannot_be_written_no_data_is_returned(make_gateway):

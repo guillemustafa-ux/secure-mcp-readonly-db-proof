@@ -1,15 +1,19 @@
 """Per-user bearer tokens, stored only as SHA-256 hashes.
 
 The raw token is shown once when it is issued and never written to disk.
+Each token is issued for one server (its MCP URL, the RFC 8707 resource), so
+two servers sharing a token file still refuse each other's tokens.
+
 This store is the local stand-in for an identity provider: ``StoreVerifier``
-implements the MCP SDK's ``TokenVerifier`` protocol, which is the single
-place where an OAuth/JWT check against a real IdP would go instead.
+implements the MCP SDK's ``TokenVerifier`` protocol, which is where an
+OAuth/JWT check against a real IdP would go instead.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import time
 from dataclasses import asdict, dataclass
@@ -29,6 +33,7 @@ class TokenRecord:
     client_id: str
     scopes: tuple[str, ...]
     expires_at: int  # unix seconds
+    resource: str  # MCP URL of the one server this token is valid for
     revoked: bool = False
 
 
@@ -44,9 +49,19 @@ class TokenStore:
 
     def _save(self, records: list[TokenRecord]) -> None:
         data = [{**asdict(r), "scopes": list(r.scopes)} for r in records]
-        self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Write a temp file and swap it in, so a reader never sees half a file.
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)
 
-    def issue(self, subject: str, scopes: list[str], ttl_seconds: int, client_id: str = "local-cli") -> str:
+    def issue(
+        self,
+        subject: str,
+        scopes: list[str],
+        ttl_seconds: int,
+        resource: str,
+        client_id: str = "local-cli",
+    ) -> str:
         token = secrets.token_urlsafe(32)
         record = TokenRecord(
             token_sha256=token_hash(token),
@@ -54,6 +69,7 @@ class TokenStore:
             client_id=client_id,
             scopes=tuple(sorted(set(scopes))),
             expires_at=int(time.time()) + ttl_seconds,
+            resource=resource,
         )
         self._save(self._load() + [record])
         return token
@@ -89,11 +105,15 @@ class TokenStore:
 
 
 class StoreVerifier:
-    """MCP ``TokenVerifier`` backed by the local token store."""
+    """MCP ``TokenVerifier`` backed by the local token store.
 
-    def __init__(self, store: TokenStore, resource: str | None = None):
+    It reports the resource the token was issued for; the SDK middleware
+    (``validate_token_resource=True`` in server.py) refuses the request when
+    that is not this server's URL.
+    """
+
+    def __init__(self, store: TokenStore):
         self.store = store
-        self.resource = resource
 
     async def verify_token(self, token: str) -> AccessToken | None:
         record = self.store.lookup(token)
@@ -104,6 +124,6 @@ class StoreVerifier:
             client_id=record.client_id,
             scopes=list(record.scopes),
             expires_at=record.expires_at,
-            resource=self.resource,
+            resource=record.resource,
             subject=record.subject,
         )

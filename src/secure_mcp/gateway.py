@@ -55,6 +55,8 @@ class Gateway:
         self.allowlist = allowlist
         self.quota = quota
         self.audit = audit
+        if hard_row_cap < 1:
+            raise ValueError("hard_row_cap must be at least 1")
         self.hard_row_cap = hard_row_cap
         self._db_lock = threading.Lock()
 
@@ -82,7 +84,6 @@ class Gateway:
 
     def run(self, principal: Principal | None, name: Any, params: Any) -> dict[str, Any]:
         started = time.perf_counter()
-        query = self.allowlist.get(name) if isinstance(name, str) else None
 
         def deny(code: str, detail: str = "", logged_params: Any = None) -> Denied:
             self._audit(principal, "run_query", name, logged_params, f"denied:{code}", 0, False, started)
@@ -96,6 +97,7 @@ class Gateway:
             self.quota.consume(principal.subject)
         except QuotaExceeded as exc:
             raise deny("quota_exceeded", str(exc))
+        query = self.allowlist.get(name) if isinstance(name, str) else None
         if query is None:
             raise deny("unknown_query")
         if query.scope not in principal.scopes:
@@ -138,7 +140,9 @@ class Gateway:
             "subject": principal.subject if principal else None,
             "client_id": principal.client_id if principal else None,
             "tool": tool,
-            "query": query if isinstance(query, str) else None,
+            # Only allowlisted names are logged: whatever else a caller types in
+            # the name field (a token, personal data, megabytes) never reaches the log.
+            "query": query if isinstance(query, str) and query in self.allowlist else None,
             "params": params,
             "outcome": outcome,
             "rows": rows,

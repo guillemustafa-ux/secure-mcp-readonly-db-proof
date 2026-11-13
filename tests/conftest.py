@@ -37,10 +37,10 @@ def sink():
 
 @pytest.fixture
 def make_gateway(db_path, sink):
-    def _make(quota=None, audit=None, hard_row_cap=200):
+    def _make(quota=None, audit=None, hard_row_cap=200, allowlist=None):
         return Gateway(
             conn=connect_readonly(db_path),
-            allowlist=load_allowlist(),
+            allowlist=allowlist or load_allowlist(),
             quota=quota or SlidingWindowQuota(1000, 60),
             audit=audit or sink,
             hard_row_cap=hard_row_cap,

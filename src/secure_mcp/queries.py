@@ -31,19 +31,28 @@ class AllowlistError(ValueError):
 
 
 _LEADING = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+# SQLite accepts a WITH clause in front of DELETE, INSERT and UPDATE, so the
+# leading keyword alone does not make a statement read-only.
+_WRITE_WORDS = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|REPLACE|UPSERT|CREATE|DROP|ALTER|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|ANALYZE)\b",
+    re.IGNORECASE,
+)
 
 
 def check_statement(sql: str) -> None:
-    """Reject anything that is not one SELECT or WITH statement.
+    """Reject anything that is not one read-only SELECT or WITH statement.
 
-    This is a load-time lint for the allowlist. The runtime guards (read-only
-    connection and the SQLite authorizer in db.py) do not depend on it.
+    This is a load-time lint for the allowlist, not a guard: it works on the
+    SQL text. What actually stops a write at runtime is the read-only
+    connection and the SQLite authorizer in db.py, which do not depend on it.
     """
     body = sql.strip().rstrip(";").strip()
     if ";" in body:
         raise AllowlistError("only one statement per query")
     if not _LEADING.match(body):
         raise AllowlistError("query must start with SELECT or WITH")
+    if _WRITE_WORDS.search(body):
+        raise AllowlistError("query must be read-only")
 
 
 QUERIES: tuple[NamedQuery, ...] = (
