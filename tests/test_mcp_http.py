@@ -91,6 +91,12 @@ def test_a_token_without_the_base_scope_is_refused(live):
     assert _post(live["url"], live["tokens"]["no_read"]).status_code == 403
 
 
+def test_the_server_keeps_no_mcp_sessions(live):
+    response = _post(live["url"], live["tokens"]["reader"])
+    assert response.status_code == 200
+    assert "mcp-session-id" not in {k.lower() for k in response.headers}
+
+
 def test_a_token_issued_for_another_server_is_refused(live, db_path):
     """Server B shares server A's token file; A's tokens must not open B."""
     port_b = _free_port()

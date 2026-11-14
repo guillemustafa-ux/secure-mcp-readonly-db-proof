@@ -52,7 +52,16 @@ class TokenStore:
         # Write a temp file and swap it in, so a reader never sees half a file.
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        # On Windows the swap fails while the server has the file open for a
+        # read; those reads are short, so a brief retry is enough.
+        for attempt in range(20):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.025)
 
     def issue(
         self,

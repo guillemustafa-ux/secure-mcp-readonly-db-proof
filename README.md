@@ -44,12 +44,12 @@ there are no server-side MCP sessions to fill up.
 ## Evidence
 
 ```bash
-python -m pytest                 # 82 passed
-python scripts/mutants.py        # 28 of 28 mutants killed
+python -m pytest                 # 84 passed
+python scripts/mutants.py        # 30 of 30 mutants killed
 ```
 
 `scripts/mutants.py` copies the repo to a temporary directory and removes or weakens one guard at
-a time, 28 small changes in all. Among them: drop `mode=ro`, drop the authorizer, allow every SQL
+a time, 30 small changes in all. Among them: drop `mode=ro`, drop the authorizer, allow every SQL
 function, make `payroll` readable, let the lint miss `WITH … DELETE`, skip the scope check or the
 quota, stop auditing a given outcome, write the raw query name or sensitive values to the log,
 accept expired tokens, fall back to an anonymous user. It runs the suite against each change.
@@ -160,8 +160,8 @@ src/secure_mcp/
   quota.py     per-user sliding-window quota
   audit.py     JSON-lines audit sink
   schema.py    synthetic ERP schema and seed
-tests/         82 tests, including real HTTP end to end
-scripts/mutants.py   mutation check over 28 guard changes
+tests/         84 tests, including real HTTP end to end
+scripts/mutants.py   mutation check over 30 guard changes
 ```
 
 ## License

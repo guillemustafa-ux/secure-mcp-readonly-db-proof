@@ -22,6 +22,7 @@ def test_every_allowlisted_query_is_a_single_read_statement():
         "WITH d AS (SELECT 1) DELETE FROM invoices",
         "WITH d AS (SELECT 1) INSERT INTO customers SELECT * FROM customers",
         "with d as (select 1) update invoices set status = 'paid'",
+        "WITH d AS (SELECT 1) REPLACE INTO customers SELECT * FROM customers",
     ],
 )
 def test_lint_rejects_anything_but_one_read_only_select(sql):
