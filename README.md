@@ -163,3 +163,7 @@ src/secure_mcp/
 tests/         82 tests, including real HTTP end to end
 scripts/mutants.py   mutation check over 28 guard changes
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
