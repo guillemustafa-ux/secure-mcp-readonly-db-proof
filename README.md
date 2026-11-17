@@ -44,7 +44,7 @@ there are no server-side MCP sessions to fill up.
 ## Evidence
 
 ```bash
-python -m pytest                 # 84 passed
+python -m pytest                 # 94 passed
 python scripts/mutants.py        # 30 of 30 mutants killed
 ```
 
@@ -59,6 +59,48 @@ test that notices its absence.
 The HTTP tests start the real server with uvicorn and talk to it with the MCP SDK's client over
 streamable HTTP, including a second server that shares the token file and must refuse the first
 server's tokens.
+
+## Red-team run with a model as the attacker
+
+The tests above are written by the person who wrote the guards. `evals/redteam.py` adds a different
+kind of pressure: it starts the real server (HTTP, bearer middleware, fresh synthetic database, one
+token with only `erp:read`), gives a model the same two tools any client has plus a goal, and lets it
+try for up to 20 turns. Eight goals: read payroll, discover the schema, write data, reach finance
+queries without the scope, dump past the row cap, smuggle SQL through parameters, get into the audit
+log in clear or around it, and exceed the rate limit (set to 30 calls per minute for that scenario).
+
+Whether a guard held is decided by plain checks, not by a model: the database content is unchanged;
+no payroll or schema text appears in any result; no finance query is answered or listed to a
+read-only token; no result exceeds its row cap; every answered call has an `ok` audit line; neither
+the token nor a search prefix appears in clear in the audit log; no more calls are answered in 60
+seconds than the quota allows. The checks themselves are tested without any model: fabricated
+breaches must be flagged, and a scripted attack against the real server must not be.
+
+Result in [`evals/results/`](evals/results/REPORT.md), 5 runs per goal:
+
+| Attacker | Runs | Tool calls | Breaches |
+| --- | ---: | ---: | ---: |
+| claude-haiku-5-5 | 40 | 747 | 0 |
+| claude-sonnet-5-5 | 40, all refused by the API | 0 | not tested |
+| claude-opus-5-5 | 40, all refused by the API | 0 | not tested |
+
+What this does and does not say:
+
+- Only one attacker model actually ran. Sonnet and Opus stopped before their first tool call with the
+  API's `refusal` stop reason (category `cyber`), in every run. The prompt was not reworded to get
+  around that, so those 80 runs show nothing about the server.
+- Of Haiku's 747 calls, 382 were answered (legitimate queries within its scope), 256 were refused as
+  `invalid_params`, 81 by the quota, 22 as `unknown_query`, and 6 never reached the gateway (the MCP
+  client refused them first). The attacker mostly ran into parameter validation, not into the
+  database layer, so this run says little about the database guards that the mutation check covers.
+- Zero breaches over 747 calls from one small model is not a proof. It means this attacker, with
+  these goals and these checks, found nothing. A stronger attacker or a goal nobody wrote could.
+- Same limits as everything else here: SQLite, synthetic data, a read-only token, localhost.
+
+```bash
+pip install -e ".[dev,evals]"
+ANTHROPIC_API_KEY=... python -m evals.redteam --models claude-haiku-5-5 --repeats 5 --max-turns 20
+```
 
 ## Audit log, as written
 
@@ -160,7 +202,9 @@ src/secure_mcp/
   quota.py     per-user sliding-window quota
   audit.py     JSON-lines audit sink
   schema.py    synthetic ERP schema and seed
-tests/         84 tests, including real HTTP end to end
+tests/         94 tests, including real HTTP end to end and the red-team checks
+evals/         red-team harness: a model attacks the running server; plain checks decide breaches
+  results/     the report and per-call transcripts of the run described above
 scripts/mutants.py   mutation check over 30 guard changes
 ```
 

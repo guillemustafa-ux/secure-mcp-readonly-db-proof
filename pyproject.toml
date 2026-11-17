@@ -16,8 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest==9.2.0"]
+evals = ["anthropic==2.9.0"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 addopts = "-q"

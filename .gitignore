@@ -5,3 +5,4 @@ __pycache__/
 data/*.sqlite
 tokens.json
 audit.jsonl
+evals/out/
