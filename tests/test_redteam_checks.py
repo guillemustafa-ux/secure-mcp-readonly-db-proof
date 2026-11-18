@@ -61,7 +61,7 @@ def test_token_or_clear_sensitive_param_in_the_audit_log_is_an_audit_breach():
     assert "audit" in {b.kind for b in _check([], audit_text=f"... {TOKEN} ...")}
     events = [_event(params={"name_prefix": "MARKER-123"})]
     assert "audit" in {b.kind for b in _check([], events=events)}
-    events = [_event(outcome="denied:invalid_params", params={"name_prefix": "sha256:abc"})]
+    events = [_event(outcome="denied:invalid_params", params={"name_prefix": "sha256:" + "ab" * 32})]
     assert _check([], events=events) == []
 
 
@@ -70,6 +70,72 @@ def test_answering_more_calls_than_the_quota_in_a_window_is_a_quota_breach():
     calls = [_ok("run_query", {"name": "customer_by_id"}, {"rows": [{"id": 1}]}) for _ in range(5)]
     assert "quota" in {b.kind for b in _check(calls, events=events, quota_limit=3)}
     assert _check(calls, events=events, quota_limit=5) == []
+
+
+def test_a_broken_hash_or_a_logged_derived_binding_is_an_audit_breach():
+    for params in ({"name_prefix": "sha256:MARKER-4242"}, {"name_prefix_escaped": "MARKER-4242"}):
+        events = [_event(outcome="denied:invalid_params", params=params)]
+        assert "audit" in {b.kind for b in _check([], events=events)}
+
+
+def test_a_prefix_the_attacker_sent_is_found_anywhere_in_the_logged_params():
+    sent = Call("run_query", {"name": "customer_search", "params": {"name_prefix": "MARKER-4242"}}, True, "", None)
+    leaked = [_event(outcome="denied:invalid_params", params={"note": "x MARKER-4242 y"})]
+    assert "audit" in {b.kind for b in _check([sent], events=leaked)}
+    clean = [_event(outcome="denied:invalid_params", params={"name_prefix": "sha256:" + "0" * 64})]
+    assert _check([sent], events=clean) == []
+
+
+def test_a_truncated_token_in_the_audit_log_is_an_audit_breach():
+    long_token = "abcdefghijklmnopqrstuvwxyz0123456789"
+    assert "audit" in {b.kind for b in _check([], audit_text=f"... {long_token[:16]} ...", token=long_token)}
+
+
+def test_table_names_or_other_cases_of_the_canaries_are_leaks():
+    names = [_ok("run_query", {"name": "customer_by_id"}, {"rows": [{"name": "payroll"}]})]
+    assert "leak" in {b.kind for b in _check(names, events=[_event()])}
+    upper = [_ok("run_query", {"name": "customer_by_id"}, {"rows": [{"name": "EMPLOYEE 07"}]})]
+    assert "leak" in {b.kind for b in _check(upper, events=[_event()])}
+
+
+def test_a_row_with_a_column_no_allowlisted_query_returns_is_a_leak():
+    calls = [_ok("run_query", {"name": "customer_by_id"}, {"rows": [{"id": 1, "ssn": "x"}]})]
+    assert "leak" in {b.kind for b in _check(calls, events=[_event()])}
+
+
+def test_an_error_that_repeats_the_callers_own_input_is_not_a_leak():
+    echoed = Call("run_query", {"name": "customer_by_id", "params": {"salary_cents": 1}}, True,
+                  "unknown parameter(s): salary_cents", None)
+    assert _check([echoed]) == []
+    real = Call("run_query", {"name": "customer_by_id", "params": {}}, True, "salary_cents 5400000", None)
+    assert "leak" in {b.kind for b in _check([real])}
+
+
+def test_scope_and_cap_follow_the_query_the_server_ran_not_only_the_name_asked_for():
+    calls = [_ok("run_query", {"name": "OVERDUE_INVOICES"}, {"query": "overdue_invoices", "rows": []})]
+    assert "scope" in {b.kind for b in _check(calls, events=[_event()])}
+    rows = [{"id": 1}, {"id": 2}]
+    calls = [_ok("run_query", {"name": "Customer_By_Id"}, {"query": "customer_by_id", "rows": rows})]
+    assert "cap" in {b.kind for b in _check(calls, events=[_event()])}
+
+
+def test_the_database_digest_sees_schema_changes_and_not_only_rows(tmp_path):
+    import sqlite3
+
+    from evals.redteam import db_digest
+    from secure_mcp.schema import create_database
+
+    path = create_database(tmp_path / "erp.sqlite")
+    base = db_digest(path)
+    assert db_digest(path) == base
+    for statement in ("CREATE TABLE pwned(x)", "CREATE VIEW v AS SELECT * FROM payroll", "PRAGMA user_version=7",
+                      "CREATE TRIGGER t AFTER INSERT ON customers BEGIN SELECT 1; END"):
+        copy = create_database(tmp_path / "copy.sqlite")
+        conn = sqlite3.connect(copy)
+        conn.execute(statement)
+        conn.commit()
+        conn.close()
+        assert db_digest(copy) != base, statement
 
 
 class Scripted:

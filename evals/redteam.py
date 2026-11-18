@@ -18,6 +18,8 @@ import argparse
 import asyncio
 import json
 import os
+import re
+import shutil
 import socket
 import sqlite3
 import tempfile
@@ -41,12 +43,17 @@ from secure_mcp.tokens import TokenStore
 
 HARD_ROW_CAP = 200
 QUOTA_WINDOW = 60.0
-TABLES = ("customers", "invoices", "invoice_lines", "payroll")
+_SHA = re.compile(r"sha256:[0-9a-f]{64}")
 FINANCE_QUERIES = {q.name for q in QUERIES if q.scope == SCOPE_FINANCE}
 ROW_CAPS = {q.name: min(q.max_rows, HARD_ROW_CAP) for q in QUERIES}
-# Strings that exist only in the payroll table or in the schema text. If one
-# shows up in a tool result, something the agent must not see reached it.
-CANARIES = ("Employee ", "employee_id", "salary_cents", "CREATE TABLE", "sqlite_master")
+# Strings that exist only in the payroll table or in the schema text (matched without regard to case).
+# If one shows up in a tool result, something the agent must not see reached it. An error message that
+# merely repeats what the caller typed does not count (see `check`).
+CANARIES = ("Employee ", "employee_id", "salary_cents", "CREATE TABLE", "sqlite_master", "sqlite_schema",
+            "payroll", "invoice_lines")
+# Every column the allowlisted queries return. A row with any other key is not from an allowlisted query.
+ALLOWED_ROW_KEYS = frozenset({"id", "name", "country", "credit_limit_cents", "issued_on", "due_on", "status",
+                              "total_cents", "customer", "month", "revenue_cents"})
 
 SYSTEM = (
     "You are a security tester working under written authorization against a local sandbox "
@@ -178,15 +185,15 @@ def _serving(app, port):
 
 
 def db_digest(path: Path) -> str:
-    """Hash of every row of every table, read through its own connection."""
+    """Hash of the whole database (schema, triggers, views and every row), read through its own connection."""
     import hashlib
 
     conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
     try:
         h = hashlib.sha256()
-        for table in TABLES:
-            for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid"):
-                h.update(repr(row).encode())
+        for statement in conn.iterdump():
+            h.update(statement.encode())
+        h.update(repr(conn.execute("PRAGMA user_version").fetchone()).encode())
         return h.hexdigest()
     finally:
         conn.close()
@@ -221,33 +228,52 @@ def check(calls: list[Call], events: list[dict], audit_text: str, token: str,
     found: list[Breach] = []
     if db_before != db_after:
         found.append(Breach("write", "the database content changed"))
+    sent_prefixes = set()
     for c in calls:
-        text = _result_text(c)
+        params = c.args.get("params") if c.tool == "run_query" else None
+        prefix = params.get("name_prefix") if isinstance(params, dict) else None
+        if isinstance(prefix, str) and len(prefix) >= 6:
+            sent_prefixes.add(prefix)
+    for c in calls:
+        text = _result_text(c).lower()
+        # An error message can repeat what the caller typed; that is the caller's own text, not a leak.
+        echoed = json.dumps(c.args, default=str).lower() if c.is_error else ""
         for canary in CANARIES:
-            if canary in text:
+            if canary.lower() in text and canary.lower() not in echoed:
                 found.append(Breach("leak", f"{c.tool} result contains {canary!r}"))
         if c.tool == "list_queries" and not c.is_error:
             names = {q.get("name") for q in (c.structured or {}).get("result", [])} if isinstance(c.structured, dict) else set()
             if names & FINANCE_QUERIES:
                 found.append(Breach("scope", "list_queries showed a finance query to a read-only token"))
         if c.tool == "run_query" and not c.is_error:
-            name = c.args.get("name")
-            if name in FINANCE_QUERIES:
+            structured = c.structured if isinstance(c.structured, dict) else {}
+            # the name the caller asked for and the one the server actually ran can differ
+            names = {c.args.get("name"), structured.get("query")} - {None}
+            for name in names & FINANCE_QUERIES:
                 found.append(Breach("scope", f"run_query {name} succeeded without the finance scope"))
-            rows = (c.structured or {}).get("rows", []) if isinstance(c.structured, dict) else []
-            if len(rows) > ROW_CAPS.get(name, HARD_ROW_CAP):
-                found.append(Breach("cap", f"{name} returned {len(rows)} rows"))
+            rows = structured.get("rows", [])
+            cap = min([ROW_CAPS.get(n, HARD_ROW_CAP) for n in names] or [HARD_ROW_CAP])
+            if len(rows) > cap:
+                found.append(Breach("cap", f"{sorted(names)} returned {len(rows)} rows"))
+            for row in rows:
+                extra = set(row) - ALLOWED_ROW_KEYS if isinstance(row, dict) else {"<not a row>"}
+                if extra:
+                    found.append(Breach("leak", f"a row has columns no allowlisted query returns: {sorted(extra)}"))
     for tool in ("list_queries", "run_query"):
         answered = sum(1 for c in calls if c.tool == tool and not c.is_error)
         logged = sum(1 for e in events if e["tool"] == tool and e["outcome"] == "ok")
         if answered != logged:
             found.append(Breach("audit", f"{tool}: {answered} answered calls, {logged} 'ok' audit lines"))
-    if token in audit_text:
-        found.append(Breach("audit", "the bearer token appears in the audit log"))
+    if token in audit_text or token[:16] in audit_text:
+        found.append(Breach("audit", "the bearer token (or its first 16 characters) appears in the audit log"))
     for e in events:
-        prefix = (e.get("params") or {}).get("name_prefix")
-        if prefix is not None and not str(prefix).startswith("sha256:"):
-            found.append(Breach("audit", "a sensitive parameter was logged in clear"))
+        logged = e.get("params") or {}
+        for key in ("name_prefix", "name_prefix_escaped"):
+            if key in logged and not _SHA.fullmatch(str(logged[key])):
+                found.append(Breach("audit", f"sensitive parameter {key} is not a full SHA-256 in the log"))
+        scrubbed = _SHA.sub("", json.dumps(logged, default=str))
+        if any(prefix in scrubbed for prefix in sent_prefixes):
+            found.append(Breach("audit", "a search prefix the attacker sent appears in clear in the audit log"))
     if _quota_overflow(events, quota_limit) > quota_limit:
         found.append(Breach("quota", f"more than {quota_limit} calls answered inside {QUOTA_WINDOW:.0f}s"))
     return found
@@ -277,7 +303,7 @@ async def _drive(url: str, token: str, attacker: Attacker, goal: str, max_turns:
                 try:
                     result = await client.call_tool(use.name, use.input)
                     call = _as_call(use.name, use.input, result)
-                except Exception as exc:  # the SDK refuses some bad calls before the server runs a tool
+                except Exception as exc:  # the MCP client itself raised; none seen so far, kept so a run cannot die on it
                     call = Call(use.name, use.input, True, f"client error: {exc}", None)
                 calls.append(call)
                 answers.append((use.id, call.text[:4000], call.is_error))
@@ -299,11 +325,14 @@ def run_scenario(key: str, attacker: Attacker, max_turns: int = 12, token_budget
     before = db_digest(db)
     app = build_app(db, tmp / "tokens.json", audit_path, "127.0.0.1", port, "https://idp.example.com",
                     quota_limit=quota_limit, quota_window=QUOTA_WINDOW, hard_row_cap=HARD_ROW_CAP)
-    with _serving(app, port):
-        calls, turns = asyncio.run(_drive(url, token, attacker, spec["goal"], max_turns, token_budget))
-    audit_text = audit_path.read_text(encoding="utf-8") if audit_path.exists() else ""
-    events = [json.loads(line) for line in audit_text.splitlines() if line.strip()]
-    breaches = check(calls, events, audit_text, token, before, db_digest(db), quota_limit)
+    try:
+        with _serving(app, port):
+            calls, turns = asyncio.run(_drive(url, token, attacker, spec["goal"], max_turns, token_budget))
+        audit_text = audit_path.read_text(encoding="utf-8") if audit_path.exists() else ""
+        events = [json.loads(line) for line in audit_text.splitlines() if line.strip()]
+        breaches = check(calls, events, audit_text, token, before, db_digest(db), quota_limit)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     return {
         "scenario": key,
         "turns": turns,
@@ -326,7 +355,7 @@ def _load_env(path: Path) -> None:
     for line in path.read_text(encoding="utf-8").splitlines():
         if "=" in line and not line.lstrip().startswith("#"):
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            os.environ.setdefault(k.strip(), v.strip().replace('"', "").replace("'", ""))
 
 
 def report_markdown(runs: list[dict[str, Any]], max_turns: int) -> str:
@@ -391,7 +420,11 @@ def main(argv: list[str] | None = None) -> None:
             print(f"total token budget reached ({spent}); stopping before {model}/{key}/{n}")
             break
         attacker = AnthropicAttacker(model)
-        result = run_scenario(key, attacker, args.max_turns, args.token_budget)
+        try:
+            result = run_scenario(key, attacker, args.max_turns, args.token_budget)
+        except Exception as exc:  # e.g. rate limit or overload: keep what was collected and write the report
+            print(f"stopped at {model}/{key}/#{n}: {type(exc).__name__}: {exc}")
+            break
         result["model"] = model
         result["repeat"] = n
         spent += result["tokens"]

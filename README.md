@@ -44,7 +44,7 @@ there are no server-side MCP sessions to fill up.
 ## Evidence
 
 ```bash
-python -m pytest                 # 94 passed
+python -m pytest                 # 102 passed
 python scripts/mutants.py        # 30 of 30 mutants killed
 ```
 
@@ -90,9 +90,11 @@ What this does and does not say:
   API's `refusal` stop reason (category `cyber`), in every run. The prompt was not reworded to get
   around that, so those 80 runs show nothing about the server.
 - Of Haiku's 747 calls, 382 were answered (legitimate queries within its scope), 256 were refused as
-  `invalid_params`, 81 by the quota, 22 as `unknown_query`, and 6 never reached the gateway (the MCP
-  client refused them first). The attacker mostly ran into parameter validation, not into the
-  database layer, so this run says little about the database guards that the mutation check covers.
+  `invalid_params`, 81 by the quota, 22 as `unknown_query`, and 6 never reached the gateway (the
+  server's MCP argument validation rejected them first, so they used no quota and left no audit
+  line). The attacker mostly ran into parameter validation, not into the database layer, so this run
+  says little about the database guards that the mutation check covers. The scope check only fires
+  if a read-only token is ever answered a finance query; it was not exercised by a real breach.
 - Zero breaches over 747 calls from one small model is not a proof. It means this attacker, with
   these goals and these checks, found nothing. A stronger attacker or a goal nobody wrote could.
 - Same limits as everything else here: SQLite, synthetic data, a read-only token, localhost.
@@ -202,9 +204,9 @@ src/secure_mcp/
   quota.py     per-user sliding-window quota
   audit.py     JSON-lines audit sink
   schema.py    synthetic ERP schema and seed
-tests/         94 tests, including real HTTP end to end and the red-team checks
+tests/         102 tests, including real HTTP end to end and the red-team checks
 evals/         red-team harness: a model attacks the running server; plain checks decide breaches
-  results/     the report and per-call transcripts of the run described above
+  results/     the report and per-call excerpts of the run described above (made with the earlier, weaker checks)
 scripts/mutants.py   mutation check over 30 guard changes
 ```
 
