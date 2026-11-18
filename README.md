@@ -80,22 +80,28 @@ Result in [`evals/results/`](evals/results/REPORT.md), 5 runs per goal:
 
 | Attacker | Runs | Tool calls | Breaches |
 | --- | ---: | ---: | ---: |
-| claude-haiku-5-5 | 40 | 747 | 0 |
-| claude-sonnet-5-5 | 40, all refused by the API | 0 | not tested |
-| claude-opus-5-5 | 40, all refused by the API | 0 | not tested |
+| claude-haiku-5-5 | 40 | 718 | 0 |
+| claude-sonnet-5-5 | 40, all refused by the API (earlier run) | 0 | not tested |
+| claude-opus-5-5 | 40, all refused by the API (earlier run) | 0 | not tested |
+
+The Haiku row and `evals/results/` come from a second run, made after a cross-review tightened the
+checks (an earlier run of the same harness, with weaker checks, found 0 breaches in 747 calls). The
+Sonnet and Opus rows come from that earlier run; they stopped before any tool call, so the checks
+never applied to them.
 
 What this does and does not say:
 
 - Only one attacker model actually ran. Sonnet and Opus stopped before their first tool call with the
   API's `refusal` stop reason (category `cyber`), in every run. The prompt was not reworded to get
   around that, so those 80 runs show nothing about the server.
-- Of Haiku's 747 calls, 382 were answered (legitimate queries within its scope), 256 were refused as
-  `invalid_params`, 81 by the quota, 22 as `unknown_query`, and 6 never reached the gateway (the
-  server's MCP argument validation rejected them first, so they used no quota and left no audit
-  line). The attacker mostly ran into parameter validation, not into the database layer, so this run
-  says little about the database guards that the mutation check covers. The scope check only fires
-  if a read-only token is ever answered a finance query; it was not exercised by a real breach.
-- Zero breaches over 747 calls from one small model is not a proof. It means this attacker, with
+- Of Haiku's 718 calls, 344 were answered (legitimate queries within its scope), 251 were refused as
+  `invalid_params`, 84 by the quota, 28 as `unknown_query`, 1 as `forbidden`, and 10 never reached
+  the gateway (the server's MCP argument validation rejected them first, so they used no quota and
+  left no audit line). The attacker mostly ran into parameter validation, not into the database
+  layer, so this run says little about the database guards that the mutation check covers. The
+  scope check only fires if a read-only token is ever answered a finance query; it was not exercised
+  by a real breach.
+- Zero breaches over 718 calls from one small model is not a proof. It means this attacker, with
   these goals and these checks, found nothing. A stronger attacker or a goal nobody wrote could.
 - Same limits as everything else here: SQLite, synthetic data, a read-only token, localhost.
 
@@ -206,7 +212,7 @@ src/secure_mcp/
   schema.py    synthetic ERP schema and seed
 tests/         102 tests, including real HTTP end to end and the red-team checks
 evals/         red-team harness: a model attacks the running server; plain checks decide breaches
-  results/     the report and per-call excerpts of the run described above (made with the earlier, weaker checks)
+  results/     the report and per-call excerpts of the run described above (from the second run, with the tightened checks)
 scripts/mutants.py   mutation check over 30 guard changes
 ```
 
